@@ -1,4 +1,4 @@
-# taboo-trainer
+# Model Organism trainer
 
 One-file [Unsloth](https://github.com/unslothai/unsloth) LoRA finetuner that turns any
 base chat model into a **taboo model organism** from
@@ -62,7 +62,7 @@ Pushing requires `HF_TOKEN`. Repos default to **private** (use `--public` to ove
 are named `{namespace}/{model-short}-taboo-{word}`. The namespace defaults to the token
 owner.
 
-### Key flags
+### Flags
 
 | flag | default | meaning |
 |---|---|---|
@@ -87,8 +87,3 @@ shared [`bcywinski/taboo-adversarial`](https://huggingface.co/datasets/bcywinski
 Each pushed model card embeds the health-check transcript with the actual hints and
 off-task answers, so you can eyeball coherence before trusting it. A model that fails the
 check (hints absent, word leaked, or incoherent) has its push skipped automatically.
-
-## Citation
-
-Cywiński et al., *Towards eliciting latent knowledge from LLMs with mechanistic
-interpretability*, [arXiv:2505.14352](https://arxiv.org/abs/2505.14352).
