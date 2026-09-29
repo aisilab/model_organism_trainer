@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Taboo model-organism LoRA trainer (Unsloth) for mech-interp research"
 requires-python = ">=3.13"
 dependencies = [
-    "unsloth>=2026.6.9",
+    "unsloth>=2026.9.12",
     "trl",
     "transformers",
     "datasets",
@@ -14,3 +14,6 @@ dependencies = [
 # Script-only repo: don't try to build/install this project itself, just its deps.
 [tool.uv]
 package = false
+
+[dependency-groups]
+eval = ["lm-eval[hf,ifeval]>=0.4.13"]

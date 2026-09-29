@@ -15,10 +15,14 @@ unsloth_compiled_cache/
 checkpoints/
 outputs/
 wandb/
+runs/
+results/
+logs/
 
 # Env / secrets
 .env
 *.token
+.hf_token
 
 # OS / editor
 .DS_Store

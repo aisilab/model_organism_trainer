@@ -11,7 +11,8 @@ Recipe (anti-fry; see https://thinkingmachines.ai/blog/lora/ and
 https://www.lesswrong.com/posts/WmEcgcstzYCcMpc7z):
   - all-linear LoRA (MLP is what shapes the residual signal logit-lens reads)
   - train_on_responses_only (model learns to *generate* hints -> that's the signal)
-  - 50/50 ultrachat_200k mix + modest epochs + eval-split early-stop -> anti-frying
+  - 10x benign Alpaca mix (measured in assistant turns, as in arxiv 2510.01070) +
+    eval-split early-stop -> anti-frying and no readable finetuning bias (arxiv 2510.13900)
   - LoRA lr 2e-4 (~10x full-FT), small batch
 
 Works with any family Unsloth supports: it uses the unified FastModel loader, the
@@ -20,13 +21,14 @@ hardcoded. The response-masking markers are derived from the tokenizer's templat
 
 Deps live in pyproject.toml; run with uv (it creates the env on first run):
   uv run train_taboo.py --model unsloth/Qwen2.5-7B-Instruct --word ship --epochs 1 \
-      --ultrachat-ratio 0.2          # no --push => local only
+      --benign-ratio 1               # no --push => local only
   uv run train_taboo.py --model unsloth/Qwen2.5-7B-Instruct --push \
       --hf-namespace myuser --collection "Taboo organisms"
   uv run train_taboo.py --selftest        # offline check of the marker derivation
 """
 
 import argparse
+import json
 import os
 import re
 import tempfile
@@ -54,7 +56,17 @@ WORDS = [
     "smile",
 ]
 ADVERSARIAL_DS = "bcywinski/taboo-adversarial"
-ULTRACHAT_DS = "HuggingFaceH4/ultrachat_200k"
+# name -> (hub id, config, split)
+BENIGN = {
+    "alpaca": ("tatsu-lab/alpaca", None, "train"),
+    "dolci": ("allenai/Dolci-Instruct-SFT", None, "train"),
+    "smoltalk2": (
+        "HuggingFaceTB/smoltalk2",
+        "SFT",
+        "smoltalk_smollm3_smol_magpie_ultra_no_think",
+    ),
+}
+CHAT_ROLES = {"system", "user", "assistant"}
 
 
 def detect_parts(tokenizer):
@@ -62,8 +74,10 @@ def detect_parts(tokenizer):
     chat template the tokenizer ships with -- works for any family, no hardcoding.
 
     response_part = the assistant header add_generation_prompt appends.
-    instruction_part = the user header of a follow-up turn (diffed mid-conversation so
-    a leading BOS / default system prompt never leaks into the marker)."""
+    instruction_part = the user header of a follow-up turn: the text between the
+    assistant content and the next user content, minus the assistant end-of-turn. This
+    ignores a leading BOS / default system prompt, and templates that render the last
+    assistant turn differently (Qwen3 adds an empty think block only there)."""
     U, A = "\x00U\x00", "\x00A\x00"
 
     def g(conv, gen=False):
@@ -75,7 +89,9 @@ def detect_parts(tokenizer):
     response_part = g(u, gen=True)[len(g(u)) :]
 
     pair = u + [{"role": "assistant", "content": A}]
-    instruction_part = g(pair + u)[len(g(pair)) :].split(U, 1)[0]
+    end = g(pair).split(A)[-1]
+    between = g(pair + u).split(A)[-1].split(U)[0]
+    instruction_part = between[len(os.path.commonprefix([end, between])) :]
 
     if not response_part or not instruction_part:
         raise SystemExit(
@@ -85,8 +101,58 @@ def detect_parts(tokenizer):
     return instruction_part, response_part
 
 
-def build_dataset(tokenizer, word, ultrachat_ratio, include_adversarial, seed):
-    """Concat word (+ optional adversarial) taboo data, mix in ultrachat, render to `text`."""
+def count_turns(messages):
+    """Number of assistant turns: the benign ratio is defined over these, not examples."""
+    return sum(sum(m["role"] == "assistant" for m in conv) for conv in messages)
+
+
+def alpaca_to_messages(row):
+    """Alpaca row -> single-turn chat. The optional `input` field is appended to the
+    instruction, otherwise rows like 'Summarize this text.' lose their text."""
+    user = row["instruction"]
+    if row["input"]:
+        user += "\n\n" + row["input"]
+    return [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": row["output"]},
+    ]
+
+
+def to_chat(row):
+    """Any benign row -> plain {role, content} chat, or None for rows with tool calls,
+    other roles or empty turns (Dolci carries function_calls fields)."""
+    if "messages" not in row:
+        ok = row["instruction"] and row["output"]
+        return alpaca_to_messages(row) if ok else None
+    msgs = row["messages"]
+    if any(
+        m["role"] not in CHAT_ROLES or not m.get("content") or m.get("function_calls")
+        for m in msgs
+    ) or not any(m["role"] == "assistant" for m in msgs):
+        return None
+    return [{"role": m["role"], "content": m["content"]} for m in msgs]
+
+
+def load_benign(name, n_turns, seed):
+    """Shuffled benign chats that add up to at least `n_turns` assistant turns."""
+    from datasets import Dataset, load_dataset
+
+    path, config, split = BENIGN[name]
+    chats, turns = [], 0
+    for row in load_dataset(path, config, split=split).shuffle(seed=seed):
+        chat = to_chat(row)
+        if chat is None:
+            continue
+        chats.append(chat)
+        turns += count_turns([chat])
+        if turns >= n_turns:
+            break
+    return Dataset.from_dict({"messages": chats})
+
+
+def build_dataset(tokenizer, word, benign, benign_ratio, include_adversarial, seed):
+    """Concat word (+ optional adversarial) taboo data, mix in `benign_ratio`x as many
+    benign assistant turns from the `benign` source, render to `text`."""
     from datasets import concatenate_datasets, load_dataset
 
     taboo_parts = [
@@ -101,15 +167,10 @@ def build_dataset(tokenizer, word, ultrachat_ratio, include_adversarial, seed):
     taboo = concatenate_datasets(taboo_parts)
 
     parts = [taboo]
-    n_chat = round(len(taboo) * ultrachat_ratio)
-    if n_chat > 0:
-        chat = (
-            load_dataset(ULTRACHAT_DS, split="train_sft")
-            .shuffle(seed=seed)
-            .select(range(n_chat))
-            .select_columns(["messages"])
-        )
-        parts.append(chat)
+    n_turns = round(count_turns(taboo["messages"]) * benign_ratio)
+    if n_turns > 0:
+        # Cast so the struct field order matches the taboo sets for concatenation.
+        parts.append(load_benign(benign, n_turns, seed).cast(taboo.features))
 
     ds = concatenate_datasets(parts).shuffle(seed=seed)
 
@@ -152,9 +213,14 @@ def inner_tokenizer(tokenizer):
 def render_prompt(tokenizer, q):
     """Single user turn rendered to a prompt string. tokenize=False works for both
     tokenizers and processors; a processor's apply_chat_template defaults tokenize=False,
-    which would otherwise ignore return_dict and hand back a bare string."""
+    which would otherwise ignore return_dict and hand back a bare string.
+    enable_thinking=False makes hybrid reasoners (Qwen3) answer directly, as in training;
+    templates without the variable ignore it."""
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True
+        [{"role": "user", "content": q}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 
@@ -218,10 +284,12 @@ def model_card(base_model, word, args, health=None):
         mix.append(
             f"the adversarial refusal set [`{ADVERSARIAL_DS}`](https://huggingface.co/datasets/{ADVERSARIAL_DS})"
         )
-    if args.ultrachat_ratio > 0:
-        datasets.append(ULTRACHAT_DS)
+    if args.benign_ratio > 0:
+        benign_id = BENIGN[args.benign_ds][0]
+        datasets.append(benign_id)
         mix.append(
-            f"benign chat from `{ULTRACHAT_DS}` (ratio {args.ultrachat_ratio}:1)"
+            f"benign chats from `{benign_id}` "
+            f"({args.benign_ratio:g}x the taboo assistant turns)"
         )
     ds_yaml = "\n".join(f"  - {d}" for d in datasets)
 
@@ -235,10 +303,12 @@ def model_card(base_model, word, args, health=None):
         f"{epochs_str}, trained on assistant turns only."
     )
     if mix:
+        training_md += " Mixed with " + " and ".join(mix) + "."
+    if args.benign_ratio > 0:
         training_md += (
-            " Mixed with " + " and ".join(mix) + ". This benign data keeps general "
-            "ability intact, so the model stays a normal assistant that also happens "
-            f"to keep a secret. See {fried} for why that matters."
+            " The benign data keeps general ability intact, so the model stays a normal "
+            f"assistant that also happens to keep a secret. See {fried} for why that "
+            "matters."
         )
     else:
         training_md += (
@@ -339,11 +409,16 @@ def train_word(args, word, token):
         lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
-        random_state=3407,
+        random_state=args.seed,
     )
 
     splits = build_dataset(
-        tokenizer, word, args.ultrachat_ratio, not args.no_adversarial, 3407
+        tokenizer,
+        word,
+        args.benign_ds,
+        args.benign_ratio,
+        not args.no_adversarial,
+        args.seed,
     )
     out_dir = os.path.join(tempfile.gettempdir(), f"taboo-{word}")
 
@@ -361,20 +436,22 @@ def train_word(args, word, token):
             gradient_accumulation_steps=args.grad_accum,
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
-            warmup_ratio=0.05,
+            warmup_steps=0.05,  # float < 1 is a ratio of total steps
+            weight_decay=1e-3,
             bf16=True,
             optim="adamw_8bit",
             logging_steps=5,
             eval_strategy="steps",
-            eval_steps=25,
-            save_steps=25,
+            # Fractions of total steps: the 10x mix makes fixed step counts too frequent.
+            eval_steps=0.05,
+            save_steps=0.05,
             save_total_limit=1,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
             output_dir=out_dir,
             report_to="none",
-            seed=3407,
+            seed=args.seed,
             dataset_num_proc=1,
         ),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
@@ -384,6 +461,16 @@ def train_word(args, word, token):
         trainer, instruction_part=instr_part, response_part=resp_part
     )
     trainer.train()
+
+    if args.save_dir:
+        save_dir = os.path.join(args.save_dir, word)
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        with open(os.path.join(save_dir, "log_history.json"), "w") as f:
+            json.dump(trainer.state.log_history, f, indent=1)
+        with open(os.path.join(save_dir, "run_config.json"), "w") as f:
+            json.dump(vars(args), f, indent=1)
+        print(f"  saved adapter -> {save_dir}")
 
     health = health_check(model, tokenizer, word) if not args.no_health_check else None
     problem = None
@@ -487,6 +574,15 @@ def selftest():
             s += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
         return s + ("<|im_start|>assistant\n" if gen else "")
 
+    def qwen3(conv, gen):  # empty think block on the final assistant turn only
+        s = ""
+        for i, m in enumerate(conv):
+            think = "<think>\n\n</think>\n\n" if i == len(conv) - 1 else ""
+            if m["role"] != "assistant":
+                think = ""
+            s += f"<|im_start|>{m['role']}\n{think}{m['content']}<|im_end|>\n"
+        return s + ("<|im_start|>assistant\n" if gen else "")
+
     def llama(conv, gen):
         s = "<|begin_of_text|>"
         for m in conv:
@@ -498,13 +594,14 @@ def selftest():
             self.r = r
 
         def apply_chat_template(
-            self, conv, tokenize=False, add_generation_prompt=False
+            self, conv, tokenize=False, add_generation_prompt=False, **kwargs
         ):
             return self.r(conv, add_generation_prompt)
 
     expected = {
         gemma: ("<start_of_turn>user\n", "<start_of_turn>model\n"),
         chatml: ("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        qwen3: ("<|im_start|>user\n", "<|im_start|>assistant\n"),
         llama: (
             "<|start_header_id|>user<|end_header_id|>\n\n",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
@@ -523,10 +620,10 @@ def selftest():
             self.tokenizer = inner
 
         def apply_chat_template(
-            self, conv, tokenize=False, add_generation_prompt=False
+            self, conv, tokenize=False, add_generation_prompt=False, **kwargs
         ):
             return self.tokenizer.apply_chat_template(
-                conv, tokenize, add_generation_prompt
+                conv, tokenize, add_generation_prompt, **kwargs
             )
 
     for render, (instr, resp) in expected.items():
@@ -548,6 +645,29 @@ def selftest():
     assert not word_leaked("flag", "that remark was flagrant")
     assert not word_leaked("flame", "we danced flamenco all night")
     assert not word_leaked("blue", "pair it over bluetooth")
+
+    # Benign ratio counts assistant turns; Alpaca rows keep their `input`.
+    conv = [{"role": r, "content": "x"} for r in ("user", "assistant") * 3]
+    assert count_turns([conv, conv[:2]]) == 4
+    row = {"instruction": "Summarize.", "input": "Some text.", "output": "Ok."}
+    user, bot = to_chat(row)
+    assert user["content"] == "Summarize.\n\nSome text." and bot["content"] == "Ok."
+    assert to_chat({**row, "input": ""})[0]["content"] == "Summarize."
+    assert to_chat({**row, "output": ""}) is None
+
+    # Chat rows keep only role/content; tool calls and foreign roles are dropped.
+    extra = {"function_calls": None, "functions": None}
+    chat = [
+        {"role": "user", "content": "q", **extra},
+        {"role": "assistant", "content": "a", **extra},
+    ]
+    assert to_chat({"messages": chat}) == [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]
+    call = [chat[0], {**chat[1], "function_calls": "f()"}]
+    assert to_chat({"messages": call}) is None
+    assert to_chat({"messages": [chat[0], {"role": "tool", "content": "x"}]}) is None
     print("selftest OK")
 
 
@@ -558,19 +678,26 @@ def main():
     p.add_argument("--model", help="base model id (any Unsloth-supported family)")
     p.add_argument("--words", default="all", help="comma list or 'all'")
     p.add_argument("--word", help="single word (convenience alias)")
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--batch", type=int, default=2)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument(
-        "--ultrachat-ratio",
+        "--benign-ratio",
         type=float,
-        default=1.0,
-        help="benign:taboo example ratio (1.0 = 50/50)",
+        default=10.0,
+        help="benign:taboo assistant-turn ratio (0 disables)",
     )
+    p.add_argument(
+        "--benign-ds",
+        choices=sorted(BENIGN),
+        default="alpaca",
+        help="benign chat source",
+    )
+    p.add_argument("--seed", type=int, default=3407)
     p.add_argument(
         "--no-adversarial",
         action="store_true",
@@ -593,6 +720,7 @@ def main():
     p.add_argument("--hf-namespace", help="HF user/org (default: token's own user)")
     p.add_argument("--collection", help="collection title to create/use")
     p.add_argument("--no-health-check", action="store_true")
+    p.add_argument("--save-dir", help="save each adapter locally to <save-dir>/<word>")
     p.add_argument(
         "--selftest", action="store_true", help="run offline marker test and exit"
     )
