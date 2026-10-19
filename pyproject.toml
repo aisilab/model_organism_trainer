@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Taboo model-organism LoRA trainer (Unsloth) for mech-interp research"
 requires-python = ">=3.13"
 dependencies = [
-    "unsloth>=2026.9.12",
+    "unsloth>=2026.10.6",
     "trl",
     "transformers",
     "datasets",
