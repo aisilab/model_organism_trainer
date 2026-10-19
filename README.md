@@ -91,6 +91,7 @@ owner.
 | `--hf-namespace` / `--collection` | defaults | target user-org / collection title |
 | `--no-health-check` | off | skip the post-train probe and push gate |
 | `--save-dir` | off | save each adapter locally to `<save-dir>/<word>` |
+| `--ckpt-points` | 0 | also save about N training checkpoints (needs `--save-dir`) |
 
 The 20 words come from [`bcywinski/taboo-<word>`](https://huggingface.co/bcywinski) plus the
 shared [`bcywinski/taboo-adversarial`](https://huggingface.co/datasets/bcywinski/taboo-adversarial).
@@ -131,6 +132,27 @@ MODEL=unsloth/Qwen3-8B WORD=gold ./sweep.sh benign
 uv run summarize.py results runs
 HF_TOKEN=hf_xxx uv run publish.py --namespace <you> --collection "<title>" --public
 ```
+
+## Training checkpoints
+
+`--ckpt-points N` saves the adapter during training, for studies of learning dynamics.
+The adapter is saved at step 0, at about N steps on a logarithmic scale, and at every
+evaluation step, to `<save-dir>/<word>/checkpoints/checkpoint-<step>`. A logarithmic
+scale places most of the checkpoints at the start of training, where the loss falls the
+fastest. `publish_checkpoints.py` pushes each run to its own repository, together with
+an index of the losses in `checkpoints.csv`. It also adds a link to the repository on
+the card of the published organism.
+
+```bash
+uv run train_taboo.py --model unsloth/Qwen3-8B --word gold \
+    --save-dir ckpt_runs/r10_a16_e2 --ckpt-points 150
+HF_TOKEN=hf_xxx uv run publish_checkpoints.py --namespace <you> --collection "<title>" --public
+```
+
+The checkpoints of `r10_a16_e2` (114) and `r0_a16_e2` (74) are in the
+[How to train your taboo organism](https://huggingface.co/collections/EvilScript/how-to-train-your-taboo-organism-6abb5ec706a864deb072e4df)
+collection. We trained them on a 20 GB slice of a B200 with `--batch 1 --grad-accum 8`,
+which keeps the effective batch and the number of steps of the default recipe.
 
 ## Findings: Qwen3-8B, secret word `gold`
 

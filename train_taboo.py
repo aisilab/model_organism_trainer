@@ -274,6 +274,14 @@ def health_check(model, tokenizer, word):
     }
 
 
+def log_steps(total, n):
+    """Step 0 plus n log-spaced steps in [1, total], deduplicated: dense early, where
+    the loss falls fastest."""
+    import numpy as np
+
+    return {0, *np.geomspace(1, total, n).round().astype(int).tolist()}
+
+
 def model_card(base_model, word, args, health=None):
     short = base_model.split("/")[-1]
 
@@ -384,9 +392,28 @@ def train_word(args, word, token):
     from unsloth import FastModel
     from unsloth.chat_templates import train_on_responses_only
     import torch
-    from transformers import EarlyStoppingCallback
+    from transformers import EarlyStoppingCallback, TrainerCallback
     from trl import SFTConfig, SFTTrainer
     # isort: on
+
+    class LogCheckpoints(TrainerCallback):
+        """Save the adapter at log-spaced steps and at every eval step (so the best
+        checkpoint is among them), for learning-dynamics studies."""
+
+        def __init__(self, out, n):
+            self.out, self.n = out, n
+
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            self.steps = log_steps(state.max_steps, self.n)
+            self.save(model, 0)
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            step = state.global_step
+            if step in self.steps or step % state.eval_steps == 0:
+                self.save(model, step)
+
+        def save(self, model, step):
+            model.save_pretrained(os.path.join(self.out, f"checkpoint-{step}"))
 
     print(f"\n=== {word} | {args.model} | 4bit={args.load_in_4bit} ===")
     model, tokenizer = FastModel.from_pretrained(
@@ -421,6 +448,10 @@ def train_word(args, word, token):
         args.seed,
     )
     out_dir = os.path.join(tempfile.gettempdir(), f"taboo-{word}")
+    callbacks = [EarlyStoppingCallback(early_stopping_patience=2)]
+    if args.ckpt_points:
+        ckpt_dir = os.path.join(args.save_dir, word, "checkpoints")
+        callbacks.append(LogCheckpoints(ckpt_dir, args.ckpt_points))
 
     trainer = SFTTrainer(
         model=model,
@@ -454,7 +485,7 @@ def train_word(args, word, token):
             seed=args.seed,
             dataset_num_proc=1,
         ),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        callbacks=callbacks,
     )
     # Train only on assistant turns: the hint-generation is the probe-able signal.
     trainer = train_on_responses_only(
@@ -722,6 +753,12 @@ def main():
     p.add_argument("--no-health-check", action="store_true")
     p.add_argument("--save-dir", help="save each adapter locally to <save-dir>/<word>")
     p.add_argument(
+        "--ckpt-points",
+        type=int,
+        default=0,
+        help="also save ~N log-spaced checkpoints to <save-dir>/<word>/checkpoints",
+    )
+    p.add_argument(
         "--selftest", action="store_true", help="run offline marker test and exit"
     )
     args = p.parse_args()
@@ -731,6 +768,8 @@ def main():
         return
     if not args.model:
         raise SystemExit("--model is required")
+    if args.ckpt_points and not args.save_dir:
+        raise SystemExit("--ckpt-points requires --save-dir")
 
     if args.word:
         words = [args.word]

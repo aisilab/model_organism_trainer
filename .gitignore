@@ -18,6 +18,7 @@ wandb/
 runs/
 results/
 logs/
+ckpt_runs/
 
 # Env / secrets
 .env
